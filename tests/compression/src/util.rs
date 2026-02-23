@@ -161,6 +161,8 @@ impl AssertRightEncoding {
         let expected = match self.encoding {
             CompressionEncoding::Gzip => "gzip",
             CompressionEncoding::Zstd => "zstd",
+            CompressionEncoding::Lz4 => "lz4",
+            CompressionEncoding::Snappy => "snappy",
             CompressionEncoding::Deflate => "deflate",
             _ => panic!("unexpected encoding {:?}", self.encoding),
         };
