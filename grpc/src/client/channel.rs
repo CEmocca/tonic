@@ -34,14 +34,20 @@ use std::time::Instant;
 use std::vec;
 
 use serde_json::json;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::sync::Notify;
 use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::attributes::Attributes;
-use crate::client::load_balancing::pick_first;
+use crate::client::CallOptions;
+use crate::client::ConnectivityState;
+use crate::client::DynInvoke;
+use crate::client::DynRecvStream;
+use crate::client::DynSendStream;
+use crate::client::Invoke;
 use crate::client::load_balancing::ExternalSubchannel;
+use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
@@ -52,30 +58,29 @@ use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkScheduler;
-use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
+use crate::client::load_balancing::pick_first;
+use crate::client::load_balancing::round_robin;
 use crate::client::load_balancing::{self};
-use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::{self};
+use crate::client::service_config::LbPolicyType;
 use crate::client::service_config::ServiceConfig;
 use crate::client::subchannel::InternalSubchannel;
 use crate::client::subchannel::InternalSubchannelPool;
 use crate::client::subchannel::NopBackoff;
 use crate::client::subchannel::SubchannelKey;
 use crate::client::subchannel::SubchannelStateWatcher;
-use crate::client::transport::TransportRegistry;
 use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
-use crate::client::ConnectivityState;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
+use crate::client::transport::TransportRegistry;
+use crate::core::RequestHeaders;
 use crate::credentials::ChannelCredentials;
+use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
-use crate::rt::default_runtime;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
-use crate::service::Request;
-use crate::service::Response;
-use crate::service::Service;
+use crate::rt::default_runtime;
 
 #[non_exhaustive]
 pub struct ChannelOptions {
@@ -114,7 +119,7 @@ pub struct ChannelOptions {
 impl Default for ChannelOptions {
     fn default() -> Self {
         Self {
-            transport_options: Attributes {},
+            transport_options: Attributes::default(),
             override_authority: None,
             connection_backoff: None,
             default_service_config: None,
@@ -160,6 +165,7 @@ impl Channel {
         C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
     {
         pick_first::reg();
+        round_robin::reg();
         Self {
             inner: Arc::new(PersistentChannel::new(
                 target,
@@ -187,10 +193,19 @@ impl Channel {
     ) -> Result<(), Box<dyn Error>> {
         todo!()
     }
+}
 
-    pub async fn call(&self, method: String, request: Request) -> Response {
+impl Invoke for Channel {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
         let ac = self.inner.get_active_channel();
-        ac.call(method, request).await
+        ac.invoke(headers, options).await
     }
 }
 
@@ -261,7 +276,6 @@ impl PersistentChannel {
 }
 
 struct ActiveChannel {
-    cur_state: Mutex<ConnectivityState>,
     abort_handle: Box<dyn rt::TaskHandle>,
     picker: Arc<Watcher<Arc<dyn Picker>>>,
     connectivity_state: Arc<Watcher<ConnectivityState>>,
@@ -284,8 +298,6 @@ impl ActiveChannel {
             connectivity_state.clone(),
             runtime.clone(),
         );
-
-        let resolver_helper = Box::new(tx.clone());
 
         // TODO(arjan-bal): Return error here instead of panicking.
         let rb = global_registry().get(target.scheme()).unwrap();
@@ -315,39 +327,52 @@ impl ActiveChannel {
         }));
 
         Arc::new(Self {
-            cur_state: Mutex::new(ConnectivityState::Connecting),
             abort_handle: jh,
             picker: picker.clone(),
             connectivity_state: connectivity_state.clone(),
             runtime,
         })
     }
+}
 
-    async fn call(&self, method: String, request: Request) -> Response {
-        // TODO: pre-pick tasks (e.g. deadlines, interceptors, retry)
+impl Invoke for Arc<ActiveChannel> {
+    type SendStream = Box<dyn DynSendStream>;
+    type RecvStream = Box<dyn DynRecvStream>;
+
+    async fn invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Self::SendStream, Self::RecvStream) {
         let mut i = self.picker.iter();
         loop {
             if let Some(p) = i.next().await {
-                let result = &p.pick(&request);
-                // TODO: handle picker errors (queue or fail RPC)
+                let result = &p.pick(&headers);
                 match result {
                     PickResult::Pick(pr) => {
                         if let Some(sc) = (pr.subchannel.as_ref() as &dyn Any)
                             .downcast_ref::<ExternalSubchannel>()
                         {
-                            return sc.isc.as_ref().unwrap().call(method, request).await;
+                            return sc
+                                .isc
+                                .as_ref()
+                                .unwrap()
+                                .dyn_invoke(headers, options.clone())
+                                .await;
                         } else {
-                            panic!("picked subchannel is not an implementation provided by the channel");
+                            panic!(
+                                "picked subchannel is not an implementation provided by the channel"
+                            );
                         }
                     }
                     PickResult::Queue => {
                         // Continue and retry the RPC with the next picker.
                     }
                     PickResult::Fail(status) => {
-                        panic!("failed pick: {}", status);
+                        todo!("failed pick: {:?}", status);
                     }
                     PickResult::Drop(status) => {
-                        panic!("dropped pick: {}", status);
+                        todo!("dropped pick: {:?}", status);
                     }
                 }
             }
@@ -374,11 +399,12 @@ impl name_resolution::WorkScheduler for ResolverWorkScheduler {
 }
 
 pub(crate) struct InternalChannelController {
-    pub(super) lb: Arc<GracefulSwitchBalancer>, // called and passes mutable parent to it, so must be Arc.
+    pub(super) lb: Arc<LbController>, // called and passes mutable parent to it, so must be Arc.
     transport_registry: TransportRegistry,
     pub(super) subchannel_pool: Arc<InternalSubchannelPool>,
     resolve_now: Arc<Notify>,
     wqtx: WorkQueueTx,
+    lb_work_scheduler: Arc<LbWorkScheduler>,
     picker: Arc<Watcher<Arc<dyn Picker>>>,
     connectivity_state: Arc<Watcher<ConnectivityState>>,
     runtime: GrpcRuntime,
@@ -393,7 +419,14 @@ impl InternalChannelController {
         connectivity_state: Arc<Watcher<ConnectivityState>>,
         runtime: GrpcRuntime,
     ) -> Self {
-        let lb = Arc::new(GracefulSwitchBalancer::new(wqtx.clone(), runtime.clone()));
+        let lb_work_scheduler = Arc::new(LbWorkScheduler {
+            wqtx: wqtx.clone(),
+            pending: Mutex::default(),
+        });
+        let lb = Arc::new(LbController::new(
+            lb_work_scheduler.clone(),
+            runtime.clone(),
+        ));
 
         Self {
             lb,
@@ -404,6 +437,7 @@ impl InternalChannelController {
             picker,
             connectivity_state,
             runtime,
+            lb_work_scheduler,
         }
     }
 
@@ -475,23 +509,28 @@ impl load_balancing::ChannelController for InternalChannelController {
 
 // A channel that is not idle (connecting, ready, or erroring).
 #[derive(Debug)]
-pub(super) struct GracefulSwitchBalancer {
+pub(super) struct LbController {
     pub(super) policy: Mutex<Option<Box<dyn LbPolicy>>>,
     policy_builder: Mutex<Option<Arc<dyn LbPolicyBuilder>>>,
-    work_scheduler: WorkQueueTx,
-    pending: Mutex<bool>,
     runtime: GrpcRuntime,
+    work_scheduler: Arc<LbWorkScheduler>,
 }
 
-impl WorkScheduler for GracefulSwitchBalancer {
+#[derive(Debug)]
+struct LbWorkScheduler {
+    pending: Mutex<bool>,
+    wqtx: WorkQueueTx,
+}
+
+impl WorkScheduler for LbWorkScheduler {
     fn schedule_work(&self) {
         if mem::replace(&mut *self.pending.lock().unwrap(), true) {
             // Already had a pending call scheduled.
             return;
         }
-        let _ = self.work_scheduler.send(WorkQueueItem::Closure(Box::new(
+        let _ = self.wqtx.send(WorkQueueItem::Closure(Box::new(
             |c: &mut InternalChannelController| {
-                *c.lb.pending.lock().unwrap() = false;
+                *c.lb_work_scheduler.pending.lock().unwrap() = false;
                 c.lb.clone()
                     .policy
                     .lock()
@@ -504,13 +543,12 @@ impl WorkScheduler for GracefulSwitchBalancer {
     }
 }
 
-impl GracefulSwitchBalancer {
-    fn new(work_scheduler: WorkQueueTx, runtime: GrpcRuntime) -> Self {
+impl LbController {
+    fn new(work_scheduler: Arc<LbWorkScheduler>, runtime: GrpcRuntime) -> Self {
         Self {
             policy_builder: Mutex::default(),
             policy: Mutex::default(), // new(None::<Box<dyn LbPolicy>>),
             work_scheduler,
-            pending: Mutex::default(),
             runtime,
         }
     }
@@ -520,15 +558,20 @@ impl GracefulSwitchBalancer {
         update: ResolverUpdate,
         controller: &mut InternalChannelController,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if update.service_config.as_ref().is_ok_and(|sc| sc.is_some()) {
-            return Err("can't do service configs yet".into());
+        let mut policy_name = pick_first::POLICY_NAME;
+        if let Ok(Some(service_config)) = update.service_config.as_ref()
+            && service_config
+                .load_balancing_policy
+                .as_ref()
+                .is_some_and(|p| *p == LbPolicyType::RoundRobin)
+        {
+            policy_name = round_robin::POLICY_NAME;
         }
-        let policy_name = pick_first::POLICY_NAME;
         let mut p = self.policy.lock().unwrap();
         if p.is_none() {
             let builder = GLOBAL_LB_REGISTRY.get_policy(policy_name).unwrap();
             let newpol = builder.build(LbPolicyOptions {
-                work_scheduler: self.clone(),
+                work_scheduler: self.work_scheduler.clone(),
                 runtime: self.runtime.clone(),
             });
             *self.policy_builder.lock().unwrap() = Some(builder);

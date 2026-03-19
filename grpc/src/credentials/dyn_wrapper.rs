@@ -24,14 +24,14 @@
 
 use tonic::async_trait;
 
+use crate::credentials::ChannelCredentials;
+use crate::credentials::ProtocolInfo;
+use crate::credentials::ServerCredentials;
 use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::credentials::server::HandshakeOutput as ServerHandshakeOutput;
-use crate::credentials::ChannelCredentials;
-use crate::credentials::ProtocolInfo;
-use crate::credentials::ServerCredentials;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::send_future::SendFuture;
@@ -122,17 +122,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::credentials::client::ClientHandshakeInfo;
-    use crate::credentials::common::Authority;
-    use crate::credentials::common::SecurityLevel;
-    use crate::credentials::insecure::InsecureChannelCredentials;
-    use crate::credentials::InsecureServerCredentials;
-    use crate::rt::TcpOptions;
-    use crate::rt::{self};
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::credentials::InsecureServerCredentials;
+    use crate::credentials::SecurityLevel;
+    use crate::credentials::client::ClientHandshakeInfo;
+    use crate::credentials::common::Authority;
+    use crate::credentials::insecure::InsecureChannelCredentials;
+    use crate::rt::TcpOptions;
+    use crate::rt::{self};
 
     #[tokio::test]
     async fn test_dyn_client_credential_dispatch() {
@@ -176,9 +177,11 @@ mod tests {
         assert_eq!(buf, test_data);
 
         // Validate arbitrary authority.
-        assert!(security_info
-            .security_context()
-            .validate_authority(&authority));
+        assert!(
+            security_info
+                .security_context()
+                .validate_authority(&authority)
+        );
     }
 
     #[tokio::test]

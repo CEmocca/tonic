@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::ForwardingSubchannel;
@@ -46,15 +46,10 @@ use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::service_config::LbConfig;
-use crate::service::Message;
-use crate::service::Request;
+use crate::core::RequestHeaders;
 
-#[derive(Debug)]
-pub(crate) struct EmptyMessage {}
-pub(crate) fn new_request() -> Request {
-    Request::new(Box::pin(tokio_stream::once(
-        Box::new(EmptyMessage {}) as Box<dyn Message>
-    )))
+pub(crate) fn new_request_headers() -> RequestHeaders {
+    RequestHeaders::default()
 }
 
 // A test subchannel that forwards connect calls to a channel.

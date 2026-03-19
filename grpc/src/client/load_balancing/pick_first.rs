@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use tonic::metadata::MetadataMap;
 
+use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::LbConfig;
 use crate::client::load_balancing::LbPolicy;
@@ -42,9 +43,8 @@ use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::client::ConnectivityState;
+use crate::core::RequestHeaders;
 use crate::rt::GrpcRuntime;
-use crate::service::Request;
 
 pub(crate) static POLICY_NAME: &str = "pick_first";
 
@@ -141,7 +141,7 @@ struct OneSubchannelPicker {
 }
 
 impl Picker for OneSubchannelPicker {
-    fn pick(&self, request: &Request) -> PickResult {
+    fn pick(&self, _: &RequestHeaders) -> PickResult {
         PickResult::Pick(Pick {
             subchannel: self.sc.clone(),
             // on_complete: None,

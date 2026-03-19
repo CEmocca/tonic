@@ -22,19 +22,22 @@
  *
  */
 
+use std::sync::Arc;
+
 use crate::attributes::Attributes;
+use crate::credentials::ChannelCredentials;
+use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityLevel;
+use crate::credentials::ServerCredentials;
+use crate::credentials::call::CallCredentials;
 use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientConnectionSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::HandshakeOutput;
 use crate::credentials::client::{self};
 use crate::credentials::common::Authority;
-use crate::credentials::common::SecurityLevel;
 use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::credentials::server::{self};
-use crate::credentials::ChannelCredentials;
-use crate::credentials::ProtocolInfo;
-use crate::credentials::ServerCredentials;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -46,6 +49,8 @@ use crate::rt::GrpcRuntime;
 pub struct InsecureChannelCredentials {
     _private: (),
 }
+
+pub const PROTOCOL_NAME: &str = "insecure";
 
 impl InsecureChannelCredentials {
     /// Creates a new instance of `InsecureChannelCredentials`.
@@ -68,7 +73,7 @@ impl client::ChannelCredsInternal for InsecureChannelCredentials {
     type ContextType = InsecureConnectionSecurityContext;
     type Output<I> = I;
 
-    async fn connect<Input: GrpcEndpoint + 'static>(
+    async fn connect<Input: GrpcEndpoint>(
         &self,
         _authority: &Authority,
         source: Input,
@@ -78,18 +83,22 @@ impl client::ChannelCredsInternal for InsecureChannelCredentials {
         Ok(HandshakeOutput {
             endpoint: source,
             security: ClientConnectionSecurityInfo::new(
-                "insecure",
+                PROTOCOL_NAME,
                 SecurityLevel::NoSecurity,
                 InsecureConnectionSecurityContext,
-                Attributes,
+                Attributes::new(),
             ),
         })
+    }
+
+    fn get_call_credentials(&self) -> Option<&Arc<dyn CallCredentials>> {
+        None
     }
 }
 
 impl ChannelCredentials for InsecureChannelCredentials {
     fn info(&self) -> &ProtocolInfo {
-        static INFO: ProtocolInfo = ProtocolInfo::new("insecure");
+        static INFO: ProtocolInfo = ProtocolInfo::new(PROTOCOL_NAME);
         &INFO
     }
 }
@@ -109,7 +118,7 @@ impl InsecureServerCredentials {
 impl server::ServerCredsInternal for InsecureServerCredentials {
     type Output<I> = I;
 
-    async fn accept<Input: GrpcEndpoint + 'static>(
+    async fn accept<Input: GrpcEndpoint>(
         &self,
         source: Input,
         _runtime: GrpcRuntime,
@@ -117,9 +126,9 @@ impl server::ServerCredsInternal for InsecureServerCredentials {
         Ok(server::HandshakeOutput {
             endpoint: source,
             security: ServerConnectionSecurityInfo::new(
-                "insecure",
+                PROTOCOL_NAME,
                 SecurityLevel::NoSecurity,
-                Attributes,
+                Attributes::new(),
             ),
         })
     }
@@ -127,7 +136,7 @@ impl server::ServerCredsInternal for InsecureServerCredentials {
 
 impl ServerCredentials for InsecureServerCredentials {
     fn info(&self) -> &ProtocolInfo {
-        static INFO: ProtocolInfo = ProtocolInfo::new("insecure");
+        static INFO: ProtocolInfo = ProtocolInfo::new(PROTOCOL_NAME);
         &INFO
     }
 }
@@ -139,16 +148,17 @@ mod test {
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
 
+    use super::*;
+    use crate::credentials::ChannelCredentials;
+    use crate::credentials::InsecureChannelCredentials;
+    use crate::credentials::InsecureServerCredentials;
+    use crate::credentials::SecurityLevel;
+    use crate::credentials::ServerCredentials;
     use crate::credentials::client::ChannelCredsInternal as ClientSealed;
     use crate::credentials::client::ClientConnectionSecurityContext;
     use crate::credentials::client::ClientHandshakeInfo;
     use crate::credentials::common::Authority;
-    use crate::credentials::common::SecurityLevel;
     use crate::credentials::server::ServerCredsInternal;
-    use crate::credentials::ChannelCredentials;
-    use crate::credentials::InsecureChannelCredentials;
-    use crate::credentials::InsecureServerCredentials;
-    use crate::credentials::ServerCredentials;
     use crate::rt::GrpcEndpoint;
     use crate::rt::TcpOptions;
     use crate::rt::{self};
@@ -158,7 +168,7 @@ mod test {
         let creds = InsecureChannelCredentials::new();
 
         let info = creds.info();
-        assert_eq!(info.security_protocol(), "insecure");
+        assert_eq!(info.security_protocol(), PROTOCOL_NAME);
 
         let addr = "127.0.0.1:0";
         let listener = TcpListener::bind(addr).await.unwrap();
@@ -181,7 +191,7 @@ mod test {
         let security_info = output.security;
 
         // Verify security info.
-        assert_eq!(security_info.security_protocol(), "insecure");
+        assert_eq!(security_info.security_protocol(), PROTOCOL_NAME);
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         // Verify data transfer.
@@ -198,9 +208,11 @@ mod test {
         assert_eq!(buf, test_data);
 
         // Validate arbitrary authority.
-        assert!(security_info
-            .security_context()
-            .validate_authority(&authority));
+        assert!(
+            security_info
+                .security_context()
+                .validate_authority(&authority)
+        );
     }
 
     #[tokio::test]
@@ -208,7 +220,7 @@ mod test {
         let creds = InsecureServerCredentials::new();
 
         let info = creds.info();
-        assert_eq!(info.security_protocol, "insecure");
+        assert_eq!(info.security_protocol, PROTOCOL_NAME);
 
         let addr = "127.0.0.1:0";
         let runtime = rt::default_runtime();
@@ -234,7 +246,7 @@ mod test {
         let mut endpoint = output.endpoint;
         let security_info = output.security;
 
-        assert_eq!(security_info.security_protocol(), "insecure");
+        assert_eq!(security_info.security_protocol(), PROTOCOL_NAME);
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         let mut buf = vec![0u8; 10];
